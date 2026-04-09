@@ -1,0 +1,146 @@
+---
+# 1. Deployment: Максимальная отказоустойчивость и безопасность
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+spec:
+  # HPA управляет репликами, здесь не указываем
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0 # При релизе ни один старый под не умрет, пока не поднимется новый
+      maxSurge: 25%     # Разрешаем временное превышение лимита подов при деплое
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      # Security Best Practices: Запрещаем запуск от root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # Graceful Shutdown: Даем время балансировщику (Ingress/Service) убрать IP пода из iptables/IPVS
+      # до того, как приложение получит SIGTERM, иначе пользователи получат 502/504 ошибки.
+      terminationGracePeriodSeconds: 45
+
+      containers:
+      - name: app
+        image: your-repo/web-app:v1.0.0 # Всегда используем конкретный тег, а не latest
+        ports:
+        - containerPort: 8080
+          name: http
+        
+        lifecycle:
+          preStop:
+            exec:
+              # Спим 5 секунд перед SIGTERM. Это время нужно, чтобы kube-proxy обновил правила маршрутизации
+              command: ["/bin/sleep", "5"]
+
+        resources:
+          requests:
+            cpu: "100m"      # Базовое потребление. Позволяет плотно паковать поды на ноды
+            memory: "128Mi"
+          limits:
+            cpu: "1000m"     # Буст для старта (требование: 5-10 сек инициализации и первые тяжелые запросы)
+            memory: "128Mi"  # ВАЖНО: memory limit == request. Это дает поду класс Guaranteed по памяти и спасает от рандомных OOMKill при голодании ноды
+            
+        # Startup Probe защищает тяжелую инициализацию. 
+        # Даем приложению до 20 секунд (4 * 5) на "прогрев", пока liveness не начнет его убивать
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          failureThreshold: 4
+          periodSeconds: 5
+          
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+          
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 15
+          failureThreshold: 3
+
+      # Распределение для Multi-AZ (3 зоны, 5 нод)
+      topologySpreadConstraints:
+        # 1. Жестко размазываем по зонам (HA)
+        - maxSkew: 1
+          topologyKey: "topology.kubernetes.io/zone"
+          whenUnsatisfiable: DoNotSchedule 
+          labelSelector:
+            matchLabels:
+              app: web-app
+        # 2. Мягко размазываем по нодам внутри зон
+        - maxSkew: 1
+          topologyKey: "kubernetes.io/hostname"
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: web-app
+
+---
+# 2. HPA: Продвинутое автомасштабирование с Behavior Policies
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2 # Ночью оставляем 2 пода для отказоустойчивости по зонам
+  maxReplicas: 6 # Днем 4 пода + 2 запасных на случай резкого скачка (DDoS или акция)
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75 # Скейлимся ДО того, как CPU упрется в полку
+  behavior:
+    # Scale Up: реагируем быстро
+    scaleUp:
+      stabilizationWindowSeconds: 0 # Масштабируемся вверх без задержек
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    # Scale Down: скейлимся вниз плавно, чтобы не убить поды при кратковременной просадке трафика
+    scaleDown:
+      stabilizationWindowSeconds: 300 # Ждем 5 минут низкого трафика перед убийством пода
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60 # Убиваем не более 1 пода в минуту
+
+---
+# 3. PDB: Защита при обслуживании кластера (drain нод)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+spec:
+  # Используем maxUnavailable вместо minAvailable.
+  # Причина: если у нас HPA ночью скейлится до 2 подов, а minAvailable: 2, 
+  # мы заблокируем Cluster Autoscaler и обновление нод. maxUnavailable: 1 решает эту проблему.
+  maxUnavailable: 1 
+  selector:
+    matchLabels:
+      app: web-app
